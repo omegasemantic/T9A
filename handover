@@ -1,0 +1,194 @@
+# T9AMAIL — Project Handover
+
+## Goal
+Enable email read/reply functionality on an HMD feature phone (2.4" screen)
+via Opera Mini Extreme. Opera Extreme strips pages to plain text/basic HTML —
+no JS, minimal CSS, single-column only. All mail processing happens
+server-side (VPS); the phone only ever fetches simple rendered HTML pages.
+
+## Architecture principle
+Avoid live IMAP calls at the web-serving stage entirely. `mbsync` handles
+sync (cron'd), and everything downstream operates on local files only —
+fast, inspectable, no protocol round-trips while a user is waiting on a
+page load.
+
+## Two-module split (deliberate, not accidental)
+- **View Module** — read-only. Pages the mailbox, lets the user browse,
+  displays a selected message. No SMTP awareness.
+- **Compose Module** — construct + send a reply. Not yet built. Only
+  shares `mail.raw` as input with the View Module; no shared code.
+  (Originally split into "Reply" + "SMTP" but merged into one "Compose"
+  module since they're one continuous workflow with no natural seam.)
+
+`mail.raw` (a single copied raw `.eml`-equivalent message) is the sole
+bridge between the two modules — deliberately duplicating small bits of
+field-extraction logic on the Compose side rather than sharing code with
+View, since the two have different correctness requirements.
+
+## Working chain (View Module) — proven end to end
+```
+mbsync posteo          → syncs Posteo IMAP into ~/Mail/INBOX/{new,cur}
+merger.sh               → flattens new/+cur into one merged dir (fixes a
+                           real bug: messages sit in new/ until an MUA
+                           touches them, moving them to cur/ — any script
+                           scanning cur/ only will miss recent mail)
+pager.sh                → scans mailbox, writes headers.txt (UID, read
+                           status, From, Subject, Date, Warning flag)
+browse.sh                → interactive one-at-a-time viewer/menu:
+                           [n]ext [p]revious [v]iew [r]eply [q]uit
+                           - view: decodes + displays body, writes mail.raw
+                           - reply: writes mail.raw, hands off (stub only)
+choose.sh                → older list-style alternative to browse.sh
+                           (still present, not necessarily needed going
+                           forward — browse.sh is the current preferred UI)
+tmail.sh                → wrapper: mbsync → merger → pager → browse/choose
+```
+
+## Shared helper library
+`mail_helpers.sh` — sourced (not executed) by pager.sh / choose.sh /
+browse.sh / rawmail2md.sh. Contains:
+- `clean_from` — strips `<email>` brackets, prefers display name, falls
+  back to bare address if no display name exists
+- `decode_subject` — RFC 2047 decode (`=?utf-8?Q?...?=` etc.), via python3
+- `trim_date` — reformats RFC 5322 dates for display. **Uses Python's
+  `email.utils.parsedate_to_datetime`, NOT the `date -d` shell command** —
+  `date -d` silently converts to the container's local timezone, which
+  corrupted timestamps (shifted messages to the wrong day). This was a
+  real bug, found and fixed — don't revert to `date -d`.
+
+Rationale for a shared library: within the View module, field-cleaning
+rules (from/subject/date) are genuinely shared logic, not incidental
+duplication — a fix in one place should apply everywhere. This does NOT
+extend across the View/Compose boundary by design.
+
+## Filter 1 vs Filter 2 (content-safety/warning model)
+- **Filter 1** (in `pager.sh`) — cheap, advisory, per-message, runs across
+  the whole mailbox every time. Just checks `Content-Type:` header; flags
+  anything that isn't plain `text/plain` (or missing the header entirely)
+  with `Warning: !` in headers.txt. Not mission-critical — worst case is
+  a message displays messily, user just moves on. Deliberately broad
+  rather than trying to precisely classify HTML vs multipart vs
+  attachments at this stage.
+- **Filter 2** (in `rawmail2md.sh` / `browse.sh`'s `render_body()`) —
+  heavier processing on the single selected `mail.raw`. Handles:
+  - quoted-printable decoding (via python3 `quopri` module — real test
+    mail from Kiwibank required this; raw quoted-printable has soft
+    line-break artifacts like `Suffi=`/`x:` splitting words)
+  - HTML tag stripping (crude `sed`, works for simple tags; would leak
+    `<style>`/`<script>` contents if encountered — not yet an issue with
+    test mail so far)
+  - Does NOT yet handle: base64-encoded bodies, or genuine
+    `multipart/alternative` messages with MIME boundaries (mutt shows
+    these are common in real mail — a `text/plain` part alongside
+    `text/html`; correct behavior would be to prefer the plain part).
+    **This is a known, real gap, not yet built.**
+
+## View → HTML rendering plan (also not yet built, but decided)
+```
+mail.raw → rawmail2md.sh → body.md → `markdown` (the CLI tool,
+           /usr/bin/markdown, already used elsewhere by the user) → body.html
+```
+Chosen over hand-wrapping HTML in bash because:
+- `markdown` handles HTML-escaping correctly and automatically (avoids
+  a real bug that was found: unescaped `<`/`>`/`&` in a raw body would
+  break when wrapped directly in `<pre>` tags)
+- Matches the user's existing authoring workflow (writes Markdown for a
+  Jekyll site; bash scripts are being treated the same way — as
+  inspectable "sketches" that a mechanical tool converts, not something
+  requiring deep HTML knowledge)
+
+One bug already found and fixed in this path: `markdown` auto-links
+anything in `<email@domain>` form (RFC autolink syntax) — the `From:`
+field must have angle brackets stripped (via `clean_from`) *before*
+being written to the `.md` file, or it renders as an obfuscated mailto
+link instead of plain text.
+
+## Compose Module — not started (~0% done)
+Planned shape, not yet built:
+```
+mail.raw → extract From/Subject/Message-ID →
+  build RFC 5322 headers (To ← From, Subject: Re: ..., In-Reply-To,
+  References ← Message-ID) → prompt/accept body text →
+  pipe to `msmtp -t < reply.rfc`
+```
+Minimum required RFC 5322 fields confirmed: `To`, blank line, body.
+`Subject` almost always wanted. `In-Reply-To`/`References` needed for
+proper threading in the recipient's client. `From`/`Date`/`Message-ID`
+can be omitted — msmtp/server fill sensible defaults.
+
+`msmtp` is installed and configured (`~/.msmtprc`, account `posteo`,
+port 587 STARTTLS, `chmod 600`). Sending has been smoke-tested manually
+and confirmed working.
+
+## Deployment status
+- VPS: domain is **omegasemantic.org**. Plan is to serve a minimal
+  static "hello world" first (proves domain/TLS/Opera Mini reachability
+  independent of the mail pipeline), then move `mbsync` + all View
+  Module scripts onto the VPS itself (cron'd, not laptop-dependent).
+- Local dev: `localhost:PORT` via Bottle — good for logic/plumbing, but
+  **cannot** be used to test real Opera Mini Extreme rendering, since
+  Opera's proxy needs to fetch from the public internet, not localhost.
+  Periodic real-device checks against the VPS (not just at the end)
+  were agreed as the right cadence, to catch Opera-specific rendering
+  quirks early.
+- Bottle chosen as the web framework (lighter than Flask). Philosophy
+  agreed: **bash scripts stay as bash** ("sketch in bash, port to Python
+  later if someone wants to") — Bottle routes are meant to be thin
+  dispatchers, likely calling existing bash scripts via `subprocess`,
+  not a rewrite of the logic into Python. This is a deliberate choice,
+  not a placeholder.
+- Bottle installed on VPS; a minimal `hello.html` static-file-serving
+  test app was scaffolded (steps given, not yet confirmed working by
+  the user — this is the last concrete action before the thread ended).
+
+## File locations (current, on the user's working machine — "penguin")
+```
+~/T9AMAIL/
+    tmail.sh
+    merger.sh
+    pager.sh
+    choose.sh
+    browse.sh
+    rawmail2md.sh
+    mail_helpers.sh
+    headers.txt      (generated)
+    mail.raw         (generated, overwritten each selection)
+    merged/          (generated by merger.sh)
+    old/             (retired script versions)
+    README
+```
+Note: file/folder conventions for the eventual VPS layout were discussed
+in principle (`~/mailproject/scripts/`, `~/mailproject/web/`,
+`~/mailproject/tmp/`) but not yet actually created anywhere.
+
+## Immediate next steps (in likely priority order)
+1. Confirm the Bottle "hello world" test is actually reachable from
+   omegasemantic.org, then test on the real feature phone via Opera
+   Mini Extreme (not just a desktop browser).
+2. Build the Compose Module (reply construction + msmtp send), as its
+   own largely independent piece of work, using `mail.raw` as the only
+   input contract.
+3. Handle genuine `multipart/alternative` MIME messages properly in
+   Filter 2 (currently a known gap — common in real mail per mutt's own
+   parsing, not yet replicated in the bash scripts).
+4. Wire the View Module's bash scripts into Bottle routes (likely via
+   `subprocess`, per the stated bash-first philosophy), replacing the
+   CLI menu interaction with HTTP routes/links — conceptually
+   `read -p` prompts become form/link submissions carrying UID as a
+   route parameter; note state (like the "current UID" browse.sh keeps
+   in a variable) needs to travel via the URL, since HTTP requests are
+   stateless and nothing persists between clicks the way it does in a
+   single running bash script.
+5. Eventually move `mbsync` + cron off the laptop and onto the VPS, so
+   sync doesn't depend on the laptop being awake/online.
+
+## User context (do not need to re-derive, but don't over-reference)
+Comfortable with vim, bash, ChromeOS/Crostini (Linux container), has an
+existing Jekyll site on GitHub and already uses `/usr/bin/markdown` for
+lightweight tasks — this is why Markdown was chosen as the View
+Module's intermediate rendering format rather than hand-rolled HTML.
+Prefers working incrementally with real inspectable files at each
+stage over black-box tooling; explicitly values file-based checkpoints
+over in-memory/streaming approaches. Not deeply familiar with email
+protocol internals (UID semantics, MIME, IMAP) but has been picking it
+up quickly through this build.

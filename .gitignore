@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+headers.txt
+mail.raw
+body.md
+*.log

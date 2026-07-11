@@ -1,0 +1,330 @@
+# T9AMAIL — Project Handover (v2)
+
+## Goal
+Enable email read/reply functionality on an HMD feature phone (2.4" screen)
+via Opera Mini Extreme. Opera Extreme strips pages to plain text/basic HTML —
+no JS, minimal CSS, single-column only. All mail processing happens
+server-side (VPS); the phone only ever fetches simple rendered HTML pages.
+
+## Status since last handover
+The View Module chain is now proven working end-to-end, on both `penguin`
+(dev) and the VPS (deployment target). The VPS itself is now confirmed
+correctly serving over the public internet. A working outbound-send path
+has been found and tested (Resend, not SMTP — see below). Several real
+bugs were found and fixed. Two known gaps remain open: timezone display,
+and proper read-flag sync. Details follow.
+
+## Wider project context
+T9AMAIL is one module of a broader **T9A** project (an experiment in
+running useful services on the HMD feature phone to ease the practical
+gap from an iPhone). A second module, **T9AMAPS** (directions/geocoding,
+formerly `gmap`), already exists as working code but has not yet been
+migrated into the new `T9A/` structure — folder created (`/root/T9A/maps`)
+but not yet populated. Local (`penguin`) copies of both are being treated
+as the working/dev copies; the VPS copies are the deployment target.
+
+## VPS deployment — now working
+### Architecture (as actually provisioned)
+- VPS provider: Tierhive (low-cost tier). Domain: **omegasemantic.org**,
+  web-facing subdomain **map.omegasemantic.org**.
+- Tierhive fronts all IPv4 traffic through their own regional HAProxy
+  (Sydney, AU) — there is no user-facing haproxy config on the VPS
+  itself, and none is needed. The VPS has **no separate personal user
+  account** — all work is done as root directly (this was confirmed,
+  not assumed: `/home` contains nothing else).
+- Given root-only operation is unavoidable in practice, and the user has
+  explicitly deprioritised security hardening for this project (accepted
+  trade-off, discussed and confirmed), the app now also **runs its
+  service as root** — no dedicated low-privilege user. (A `t9amail` user
+  was created and then deliberately removed once this was decided; see
+  "Reversed decisions" below.)
+- Bottle binds directly to `0.0.0.0:80` — no reverse proxy, no iptables
+  redirect. This matches the pattern already proven to work by the
+  older `gmap` project's `server.py` (also root, also binds 80 directly,
+  also explicitly serves `/`).
+
+### Known Tierhive-specific gotchas (worth remembering if this recurs
+or if migrating providers)
+- **Backend health checks require the app to answer `/`, not just a
+  named file.** Bottle only had a `/hello.html` route initially; adding
+  a `/` route was the actual fix for a "backend shows Unhealthy, 503
+  from outside" problem that consumed significant debugging time.
+  Re-saving the backend config in Tierhive's console (Configure
+  Backends → re-submit) also appears to force an immediate re-check
+  rather than waiting for the next scheduled cycle — useful to know.
+- **Outbound mail ports are default-blocked.** Confirmed via direct
+  testing (`nc`): port 443 connects instantly; ports 587 and 465 both
+  time out to any destination tested, including Posteo *and* Gmail —
+  this is a general policy, not Posteo-specific. Tierhive's official
+  answer (support ticket #621, and their FAQ): they only whitelist a
+  short list of named commercial relays (Amazon SES, Mail Baby,
+  Mailgun, Mailjet, Mandrill, Resend, Sendgrid) on port 587 by default;
+  anything else needs an explicit whitelist request. A whitelist
+  request for Posteo specifically was sent and is still pending as of
+  this handover — but is no longer a blocker (see Sending, below).
+- Confirmed via `iptables -L` and `ufw status` that nothing on the VPS
+  itself is blocking outbound traffic — the restriction is entirely at
+  Tierhive's network edge, not local.
+
+### Deployment status — file layout (current)
+Consolidated under `/root/T9A/` (moved off an earlier, since-removed
+`t9amail` user's home directory):
+```
+/root/T9A/
+    mail/
+        app.py
+        static/hello.html
+        test.sh
+        venv/
+        (mail scripts to be migrated here next — see Next steps)
+    maps/          (created, not yet populated — gmap migration pending)
+```
+The original View Module scripts (`tmail.sh`, `pager.sh`, `browser.sh`,
+`mail_helpers.sh`, `rawmail2md.sh`) currently still live and are actively
+developed on `penguin` at `~/T9A/T9AMAIL/` — not yet copied to the VPS's
+`/root/T9A/mail/`. This is deliberate: dev happens locally, VPS is the
+deployment target once ready.
+
+### Bottle service
+Running as a systemd service (`t9amail-web.service`), `User=root`,
+`WorkingDirectory=/root/T9A/mail`, auto-restarts on failure, starts on
+boot. Confirmed serving both a static test page and a dynamic route
+that calls a bash script via `subprocess` — proving the exact mechanism
+the real View/Compose Modules will use to invoke `pager.sh`/`browser.sh`
+etc. from HTTP requests.
+
+### Reversed decisions (for the record)
+A dedicated non-root `t9amail` user and an iptables port-80→8080
+redirect were both set up first, then deliberately undone once (a) the
+user confirmed security hardening isn't a priority for this project,
+and (b) it was clarified the VPS has no other user anyway, so the
+separation wasn't buying meaningful isolation in practice. Don't be
+surprised to find no trace of either in the current state — this was a
+considered simplification, not an oversight.
+
+## Sending mail — solved, but not via SMTP
+### Why SMTP was abandoned
+Tierhive blocks outbound 587/465 by default (see above). Posteo isn't
+on their whitelist; neither, it turns out, is Gmail (tested directly,
+also times out) — ruling out both a Posteo-direct whitelist wait *and*
+a "just relay through Gmail" quick fix. A whitelist request for Posteo
+was sent to Tierhive and remains open, but is no longer load-bearing.
+
+### The chosen solution: Resend (HTTPS-based transactional email API)
+Resend is on Tierhive's pre-approved list, and — more importantly —
+uses a plain HTTPS API call (port 443, already confirmed open) rather
+than an SMTP connection at all, sidestepping the port restriction
+entirely regardless of which provider Tierhive does or doesn't
+whitelist.
+
+Setup completed and **tested working end-to-end**:
+- Domain `omegasemantic.org` (the bare root domain, deliberately not
+  the `map.` subdomain, to keep sending identity separate from the
+  website) verified with Resend via three DNS records added at
+  Porkbun: a DKIM TXT record (`resend._domainkey`), an SPF TXT record
+  and an MX record (both scoped to `send.omegasemantic.org`, not the
+  root — this was specifically checked and confirmed **not** to
+  conflict with the domain's existing Porkbun email forwarding, below).
+  Resend's own "enable receiving" toggle was deliberately left off — no
+  MX/receiving needed at the root domain.
+- A pre-existing, previously-forgotten Porkbun email forward was
+  discovered during this work: **`hello@omegasemantic.org` already
+  forwards to `simon.kearns@posteo.net`, and was confirmed working.**
+  This resolved an open design question (what should the `From:`/reply
+  address on outgoing relayed mail be) — decision: use
+  `hello@omegasemantic.org` as the sender address for anything sent via
+  Resend, since replies to it will land in the real Posteo inbox
+  automatically, no separate mailbox or "do not reply" disclaimer
+  needed.
+- API key generated in Resend's dashboard. A `.resendrc` file
+  (`RESEND_API_KEY=...`, intended to be sourced by scripts, same
+  pattern as `.msmtprc`) was being set up as of this handover — the
+  first attempt hit an "invalid key" error from a script that turned
+  out to be missing the `source ~/.resendrc` line entirely; root cause
+  identified, fix given, not yet confirmed working as the final state.
+- **A real test send was completed successfully** via direct `curl`
+  (not yet via `.resendrc`/script) — message sent from
+  `hello@omegasemantic.org` to `simon.kearns@posteo.net` via Resend's
+  API, confirmed to have actually arrived in the real Posteo inbox.
+  This proves the full send path end-to-end.
+
+### What replaces the original Compose Module send-plan
+The original handover's plan (`msmtp -t < reply.rfc`) is superseded for
+the "send from VPS" leg specifically — `msmtp`/`.msmtprc` remain
+correctly configured and were confirmed *functionally* correct (config
+loads, password/app-password populated, TLS negotiates), the sole
+blocker being the network-level port restriction, which Resend's
+HTTP-based approach avoids entirely. The RFC 5322 header-construction
+logic already planned (`To`, `Subject: Re: ...`, `In-Reply-To`,
+`References`) is still needed conceptually, but the final delivery hop
+becomes a `curl`/HTTP POST to Resend's API instead of a raw SMTP
+connection.
+
+## Two known, real gaps identified this session (not yet fixed)
+### 1. Timezone display
+`trim_date` (in `mail_helpers.sh`) correctly parses each message's
+original `Date:` header offset, but does **not** convert to the user's
+own timezone before display — it shows the time in whatever offset the
+sender's server used. Confirmed as a real, visible problem: a test
+email sent ~30 minutes prior displayed as "13 hours ago," consistent
+with an unconverted UTC timestamp being shown to an NZ-based reader.
+Planned fix (agreed in principle, not yet implemented): add one
+explicit conversion step using Python's `zoneinfo` module
+(`Pacific/Auckland`) — deliberately not a hardcoded fixed offset, since
+NZ observes daylight saving and a static offset would be wrong roughly
+half the year. `zoneinfo` is standard library, no new dependency.
+
+### 2. Read-flag (unread indicator) does not currently persist correctly
+The new `(N)` unread indicator in `browser.sh` (added this session,
+working correctly as a *display* of whatever `pager.sh` currently
+reports) has an unresolved backing-logic gap: nothing currently marks a
+message as read anywhere when it's viewed. Two options were discussed:
+- **Local-only** (just move the file from `new/` to `cur/`): rejected.
+  Maildir's actual spec encodes read-state in *two* places — folder
+  location *and* a `:2,S` suffix in the filename itself. A plain folder
+  move, missing the filename flag, is very likely invisible to
+  `mbsync`'s own change-detection — meaning `mbsync` would probably
+  just re-pull the server's still-unread state on next sync and move
+  the file straight back to `new/`, silently undoing the fix every
+  cycle. (Not yet empirically tested, but assessed as the likely
+  outcome based on how Maildir/mbsync's flag parsing works.)
+- **Correct Maildir flag** (rename with `:2,S` suffix *and* move to
+  `cur/`): the agreed direction. This should be recognised by mbsync's
+  bidirectional sync and genuinely propagate the read-state back to
+  Posteo's real server — meaning a message read via the phone would
+  correctly show as read on the user's normal desktop client too, not
+  just within this one pipeline.
+  
+  This was specifically decided *against* a local-only "separate
+  ledger" alternative, because of a concrete, identified failure mode:
+  the phone is a fallback device used reactively for fast-moving
+  threaded exchanges (e.g. a same-subject back-and-forth like "what
+  time dinner? / 8 works? / can't make it") — if phone-reads don't
+  propagate to the real server, the user would end up re-reading
+  already-handled thread messages from their primary client later,
+  defeating the point of having read them on the phone at all. Real
+  server-side sync was judged necessary, not optional, given this
+  specific usage pattern.
+
+Not yet implemented — likely lands in `browser.sh`'s `[v]iew` handler,
+immediately after `generate_raw` succeeds.
+
+## Bugs found and fixed this session
+- **`rawmail2md.sh` had a large duplicated block** (identical
+  body-extraction/decode/write logic appearing twice in sequence,
+  harmless in output but wasteful). Deduplicated; corrected version
+  given and confirmed working (`body.md` output verified correct
+  against a real message, including quoted-printable decoding).
+- **`browser.sh`'s `generate_raw` was non-functional**: `MAILDIRS` was
+  commented out (a leftover from an earlier, now-resolved debugging
+  detour into a `merged/` directory approach that turned out to be
+  unnecessary — the actual original bug was simpler, see below) and
+  `TMPFILE` was never defined at all. This meant `[v]iew` and `[r]eply`
+  could not work, silently. Fixed: `MAILDIRS` restored to point at the
+  real `$HOME/Mail/INBOX/{cur,new}` dirs (matching `pager.sh`);
+  `TMPFILE` defined as `"$SCRIPT_DIR/mail.raw"`. Confirmed working:
+  `[v]iew` now correctly locates, copies, and renders a real message.
+- **The original new/cur read-order mismatch** (headers.txt showing
+  unread at top, browser appearing to show them last) was **not** a
+  bug in the scripts at all — user confirmed it was their own error
+  (not scrolling to the end of the list in `browser.sh`, which
+  deliberately starts at the highest array index = most recent). The
+  `MAILDIRS=("$HOME/Mail/INBOX/cur" "$HOME/Mail/INBOX/new")` ordering
+  in `pager.sh` (cur processed first, new/unread appended last) is
+  correct and intentional, given browser.sh starts from the end of the
+  array — the two scripts' ordering assumptions are coupled by design.
+  Worth a code comment noting this coupling so a future edit to either
+  script doesn't break it unknowingly.
+
+## Relative-path cleanup (completed this session)
+All View Module scripts on `penguin` now resolve their own location via
+the standard `SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"`
+idiom and reference sibling files/scripts relative to that, rather than
+assuming a fixed install location or a particular working directory at
+invocation time. This was done deliberately, now, while the codebase is
+still small — the explicit goal being that the whole `T9AMAIL/` (soon
+`T9A/mail/`) folder can be copied anywhere (a replacement VPS, a
+different path) and just work, with no path edits required.
+- `mail_helpers.sh` — no paths, nothing needed.
+- `rawmail2md.sh` — already used `$SCRIPT_DIR` correctly; also
+  deduplicated (see Bugs, above).
+- `pager.sh` — uses `$HOME/Mail/INBOX/...` for mail data; confirmed
+  this is *correctly* left as `$HOME`-relative, not `$SCRIPT_DIR`
+  relative, since mail data is a per-machine concern, not part of the
+  codebase.
+- `browser.sh` — `HEADERS`, `TMPFILE`, and the `mail_helpers.sh` source
+  line now all use `$SCRIPT_DIR`; `MAILDIRS` correctly stays
+  `$HOME`-relative, same reasoning as `pager.sh`.
+- `tmail.sh` — rewritten to compute `$SCRIPT_DIR` and call
+  `pager.sh`/`browser.sh`/`rawmail2md.sh` via full resolved paths
+  rather than bare `./script.sh` (which only worked if invoked from
+  inside the directory).
+- **Deliberately not made relative:** `.msmtprc`, `.resendrc` — these
+  are per-machine credentials, not codebase files, and should not be
+  portable/copied along with the scripts.
+
+## Feature added this session: unread indicator
+`browser.sh` now parses the `| read` / `| unread` suffix on each `UID:`
+line in `headers.txt` (previously parsed but discarded) into a new
+`statuses` array, and displays a compact `(N)` next to the UID for any
+message whose status is `unread` — e.g. `UID: 80 (N)`. No changes
+needed to `pager.sh`, which already emitted this information. Confirmed
+working against real inbox data.
+
+## Compose Module — status update
+Still the next major build (~0% actual send-composition logic written,
+though the delivery mechanism underneath it has now been proven — see
+Sending, above). Planned shape is otherwise unchanged from the original
+handover: extract `From`/`Subject`/`Message-ID` from `mail.raw`, build
+`To`/`Subject: Re: ...`/`In-Reply-To`/`References`, accept body text,
+then — updated — POST to Resend's API (using `hello@omegasemantic.org`
+as sender) rather than piping to `msmtp`.
+
+## Immediate next steps (revised priority order)
+1. Fix `.resendrc` sourcing in the test send script (small, identified,
+   not yet confirmed fixed) — establishes the pattern the Compose
+   Module will build on.
+2. Implement the NZ timezone conversion in `trim_date` (`zoneinfo`,
+   `Pacific/Auckland`).
+3. Implement proper Maildir `:2,S` flag-setting in `browser.sh`'s
+   `[v]iew` handler, then **empirically test** that `mbsync` correctly
+   picks up and propagates the change to Posteo on next sync (this was
+   assessed as likely-correct in principle but not yet actually
+   verified — worth confirming before relying on it).
+4. Migrate the View Module scripts from `penguin`'s
+   `~/T9A/T9AMAIL/` to the VPS's `/root/T9A/mail/`, now that both the
+   scripts themselves (relative-path-safe) and the VPS hosting
+   environment (confirmed working, root-owned, port 80 direct) are
+   ready for this.
+5. Build the Compose Module proper: RFC 5322 header construction +
+   Resend API call, wired into a Bottle route via `subprocess` (proven
+   mechanism) or direct Python (since Resend's API is plain HTTPS,
+   calling it directly from Python inside Bottle is also a reasonable
+   alternative to shelling out — worth deciding which when the time
+   comes).
+6. Migrate `gmap` into `/root/T9A/maps/` (folder created, not yet
+   populated — deliberately deferred, lower priority than mail).
+7. Handle genuine `multipart/alternative` MIME messages properly (still
+   an open, known gap from the original handover — unchanged this
+   session).
+8. Wire the View Module's bash scripts into Bottle routes generally,
+   per the original handover's plan (UID travelling via URL params,
+   replacing `read -p` prompts with HTTP routes/links).
+
+## User context (do not need to re-derive, but don't over-reference)
+Comfortable with vim, bash, ChromeOS/Crostini (Linux container), has an
+existing Jekyll site on GitHub. Has, over the course of this session,
+also become comfortable with: systemd service files, iptables basics,
+DNS record management (Porkbun), and the general shape of Maildir/IMAP
+sync semantics — worth assuming this baseline going forward rather than
+re-explaining from scratch. Has explicitly and knowingly deprioritised
+security hardening for this project (root-only operation, accepted
+trade-off) — this is a considered choice, not something to
+re-litigate unprompted. Has also explicitly ruled out chasing
+commercial "hobbyist-tier" bulk-email APIs generally (prior bad
+experience on the maps/Twilio-adjacent project) — Resend was accepted
+specifically because it was already on Tierhive's whitelist and solved
+a concrete blocker, not as an endorsement of that category of service
+generally. Prefers working incrementally with real inspectable files at
+each stage over black-box tooling; explicitly values file-based
+checkpoints over in-memory/streaming approaches.
