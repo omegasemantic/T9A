@@ -1,0 +1,63 @@
+# bashmaps — transit directions via Google Routes API
+
+## chain
+input.txt → bashmaps.sh → write_request.py → request.json → curl Routes API
+→ response.json → write_steps.py → steps.json → write_result.py → result.txt
+→ server.py writes result.html → browser
+
+## scripts
+
+# bashmaps.sh
+— main orchestrator. Reads input.txt (format: origin.destination.DEP|ARR HHMM),
+parses the input string, builds an ISO 8601 timestamp, calls write_request.py to update
+request.json, POSTs to the Google Routes API, then pipes the response through write_steps.py
+(intermediate JSON) and write_result.py (plain text) to produce result.txt.
+Short walk steps under 30m are filtered from the output.
+
+# server.py
+— lightweight HTTP server (Python stdlib only).
+Serves input.html and result.html, handles form POST from input.html,
+runs the bashmaps.sh pipeline, and writes result.html from result.txt.
+Also serves a dynamic /admin page for managing city and location favourites in config.json.
+GET  /              — serve result.html
+GET  /input.html    — serve input.html
+GET  /admin         — dynamic admin page
+POST /query         — run bashmaps.sh pipeline
+POST /admin/city    — update _CITY in config.json
+POST /admin/geocode — geocode address or AT stop code, serve confirm page
+POST /admin/code    — store confirmed value in config.json
+POST /admin/delete  — remove favourite from config.json
+
+# write_request.py
+— builds request.json for the Google Routes API. Reads origin, destination,
+type (DEP|ARR) and timestamp from bashmaps.sh. Resolves locations against config.json:
+place IDs (ChIJ...), lat/lng coordinates, or address strings get appropriate API formats;
+unrecognised tokens get the default city and country appended. Mode, routing preference
+and city default are also read from config.json.
+
+# write_steps.py
+— reads response.json, extracts transit and walk steps, converts times to 24hr,
+writes structured intermediate JSON to steps.json.
+
+# write_result.py
+— reads steps.json, formats as plain text to result.txt.
+Transit legs as two-line summaries (dep/arr times leading).
+Walk steps included; short walks under 30m filtered in bashmaps.sh.
+
+## files
+# config.json   — user config and favourites, managed via /admin
+# input.html    — web query form
+# result.html   — generated at runtime by server.py from result.txt (not in git)
+# request.json  — JSON sent in curl request [write_request.py]
+# response.json — raw Routes API response [bashmaps.sh]
+# steps.json    — useful subset of response.json [write_steps.py]
+# result.txt    — human-friendly plain text [write_result.py]
+# input.txt     — current query string [testing/form POST]
+
+## utils/
+# add_fav.sh   — geocode address, confirm via Maps link, store to config.json
+
+## not in git
+# .env          — GMAPS_API_KEY, PORT
+
+
